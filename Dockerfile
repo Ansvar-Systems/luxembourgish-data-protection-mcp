@@ -6,17 +6,34 @@
 #
 # The image expects a pre-built database at /app/data/cnpd_lu.db.
 # Override with CNPD_LU_DB_PATH for a custom location.
+#
+# IMPORTANT: production stage MUST `COPY --from=builder /app/node_modules`
+# instead of re-running `npm ci`. Re-running `npm ci --ignore-scripts` strips
+# better-sqlite3's postinstall step that fetches/builds the native binding,
+# producing a runtime "Could not locate the bindings file" error on every
+# SQLite tool call. See sector-mcp-binding-recovery handover (2026-05-10).
 # ─────────────────────────────────────────────────────────────────────────────
 
-# --- Stage 1: Build TypeScript ---
+# --- Stage 1: Build TypeScript + native deps ---
 FROM node:20-slim AS builder
 
 WORKDIR /app
+
+# Install build tools required for better-sqlite3 native binding
+RUN apt-get update && apt-get install -y --no-install-recommends \
+      python3 make g++ \
+    && rm -rf /var/lib/apt/lists/*
+
 COPY package.json package-lock.json* ./
-RUN npm ci --ignore-scripts
+# Install with scripts so better-sqlite3 postinstall builds the native .node binding
+RUN npm ci
+
 COPY tsconfig.json ./
 COPY src/ src/
 RUN npm run build
+
+# Drop dev dependencies from node_modules but KEEP the better-sqlite3 native binding
+RUN npm prune --omit=dev
 
 # --- Stage 2: Production ---
 FROM node:20-slim AS production
@@ -26,9 +43,11 @@ ENV NODE_ENV=production
 ENV CNPD_LU_DB_PATH=/app/data/cnpd_lu.db
 
 COPY package.json package-lock.json* ./
-RUN npm ci --omit=dev --ignore-scripts && npm cache clean --force
-
+COPY --from=builder /app/node_modules ./node_modules
 COPY --from=builder /app/dist/ dist/
+
+# Database — provisioned by ghcr-build.yml from GitHub Release asset (database.db.gz)
+COPY data/database.db data/cnpd_lu.db
 
 # Non-root user for security
 RUN addgroup --system --gid 1001 mcp && \
